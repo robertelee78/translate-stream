@@ -7,7 +7,7 @@ from openai import OpenAI
 
 
 class TextTranslator:
-    """Translate text between configured language pairs using OpenAI GPT-4."""
+    """Translate text between configured language pairs using OpenAI GPT-5."""
     
     def __init__(self, api_key: Optional[str] = None, 
                  primary_language: Optional[str] = None,
@@ -20,7 +20,7 @@ class TextTranslator:
             raise ValueError("OpenAI API key required. Set OPENAI_API_KEY environment variable.")
         
         self.client = OpenAI(api_key=self.api_key)
-        self.model = os.getenv('DEFAULT_TRANSLATE_MODEL', 'gpt-4')
+        self.model = os.getenv('DEFAULT_TRANSLATE_MODEL', 'gpt-5')
         
         # Use ONLY the parameters passed in - NO environment variables for languages!
         # The GUI gets everything from JSON, not environment
