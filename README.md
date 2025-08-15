@@ -75,6 +75,17 @@ pip install -r requirements.txt
 
 # Output of the stream to the GUI
 ./translate-stream.sh --primary-language en --foreign-language el -i mic -o json -t | ./gui
+```
+
+### 3. GUI Usage
+
+```bash
+# Launch the GUI directly
+./gui
+
+# Or pipe transcription output to GUI
+./translate-stream.sh -o json -t | ./gui
+```
 
 ## Project Structure
 
