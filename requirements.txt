@@ -1,3 +1,22 @@
+# Audio transcription and translation dependencies
+# 
+# IMPORTANT: System dependencies required before installing:
+# 
+# Ubuntu/Debian:
+#   sudo apt-get install portaudio19-dev python3-dev python3-pyaudio ffmpeg
+#
+# macOS:
+#   brew install portaudio ffmpeg
+#
+# Windows:
+#   - Install FFmpeg from https://ffmpeg.org/download.html
+#   - PyAudio wheels should install automatically
+#
+# If PyAudio installation fails, try:
+#   Ubuntu/Debian: sudo apt-get install python3-pyaudio
+#   macOS: pip install --global-option='build_ext' --global-option='-I/usr/local/include' --global-option='-L/usr/local/lib' pyaudio
+#
+
 websockets>=12.0
 aiohttp>=3.9.0
 pyaudio>=0.2.13
