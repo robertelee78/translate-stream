@@ -70,27 +70,11 @@ pip install -r requirements.txt
 # Output as JSON
 ./translate-stream.sh -o json
 
-# Foreign language mode
-./translate-stream.sh -l hr
+# Override language configuration (English-French with translation), English <-> Greek translation, json output
+./translate-stream.sh --primary-language en --foreign-language el -i mic -o json -t
 
-# Override language configuration (English-French with translation)
-./translate-stream.sh --primary-language en --foreign-language fr -i mic -o json -t
-
-# Spanish-German transcription with translation
-./translate-stream.sh --primary-language es --foreign-language de -i mic -o json -t
-
-# Use environment defaults (from .env file)
-./translate-stream.sh -i mic -o json -t
-
-```
-
-### 3. GUI Usage
-
-```bash
-# Run the GUI application
-cd translation_gui
-python main.py
-```
+# Output of the stream to the GUI
+./translate-stream.sh --primary-language en --foreign-language el -i mic -o json -t | ./gui
 
 ## Project Structure
 
