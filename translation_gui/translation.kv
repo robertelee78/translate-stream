@@ -1,0 +1,100 @@
+#:kivy 2.1.0
+
+# Kivy design file for Translation GUI
+# Defines visual styling and layout rules
+
+<Label>:
+    markup: True
+    
+<Button>:
+    font_size: dp(14)
+    
+<ToggleButton>:
+    font_size: dp(14)
+
+# Custom button styling
+<RoundedButton@Button>:
+    canvas.before:
+        Color:
+            rgba: self.background_color if self.state == 'normal' else [0.8, 0.8, 0.8, 1]
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+    
+    background_normal: ''
+    background_down: ''
+
+# Custom toggle button styling  
+<RoundedToggleButton@ToggleButton>:
+    canvas.before:
+        Color:
+            rgba: self.background_color if self.state == 'down' else [0.3, 0.3, 0.3, 1]
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+    
+    background_normal: ''
+    background_down: ''
+
+# Message bubble styling
+<MessageBubble>:
+    canvas.before:
+        PushMatrix
+        # Subtle glow effect
+        Color:
+            rgba: 1, 1, 1, 0.1 if self.is_animating else 0.05
+        RoundedRectangle:
+            pos: self.x - dp(2), self.y - dp(2)
+            size: self.width + dp(4), self.height + dp(4)
+            radius: [dp(20)]
+        PopMatrix
+
+# Conversation panel custom styling
+<ConversationPanel>:
+    canvas.before:
+        # Subtle gradient background
+        Color:
+            rgba: 0.15, 0.15, 0.15, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
+        
+        # Top gradient
+        Color:
+            rgba: 0.2, 0.2, 0.2, 0.5
+        Rectangle:
+            pos: self.x, self.top - dp(20)
+            size: self.width, dp(20)
+
+# Audio visualizer styling
+<AudioVisualizer>:
+    canvas.before:
+        PushMatrix
+        # Background circle for circular visualizers
+        Color:
+            rgba: self.color[0], self.color[1], self.color[2], 0.1
+        Ellipse:
+            pos: self.x + self.width/2 - dp(25), self.y + self.height/2 - dp(25)
+            size: dp(50), dp(50)
+        PopMatrix
+
+# Custom scroll view styling
+<ScrollView>:
+    effect_cls: 'SmoothScrollEffect'
+    scroll_type: ['content']
+    bar_width: dp(8)
+    
+# App-wide styling rules
+<Widget>:
+    # Default text color for all widgets
+    color: 1, 1, 1, 1
+
+<BoxLayout>:
+    # Default spacing
+    spacing: dp(5)
+
+<GridLayout>:
+    # Default spacing
+    spacing: dp(5)

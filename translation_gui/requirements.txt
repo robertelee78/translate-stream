@@ -1,0 +1,28 @@
+# Kivy Translation GUI Requirements
+
+# Core Kivy framework
+kivy[base]==2.2.0
+kivymd==1.1.1
+
+# Graphics and image support
+Pillow>=9.5.0
+numpy>=1.24.0
+
+# Audio support (for PyAudio integration)
+PyAudio>=0.2.13
+sounddevice>=0.4.6
+
+# Async support for backend integration
+asyncio-mqtt>=0.11.1
+websockets>=12.0
+
+# Animation and effects
+kivy-garden.matplotlib>=0.1.1
+
+# Development and debugging
+kivy-deps.sdl2==0.6.0
+kivy-deps.glew==0.3.1
+kivy-deps.gstreamer==0.3.3
+
+# Optional: Better fonts and styling
+fonttools>=4.38.0

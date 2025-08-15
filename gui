@@ -1,0 +1,1454 @@
+#!/usr/bin/env python3
+"""
+Translation Stream GUI - iMessage-style dual panel visualizer
+Usage: ./translate-stream.sh -t -i mic -o json | ./gui
+"""
+
+import sys
+import json
+import threading
+from queue import Queue
+from datetime import datetime
+import os
+from pathlib import Path
+
+# Load environment variables from .env file
+env_file = Path(__file__).parent / '.env'
+if env_file.exists():
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ[key] = value
+
+# Set up Kivy configuration BEFORE importing any Kivy modules
+from kivy.config import Config
+
+# Set font configuration for Unicode support
+Config.set('graphics', 'default_font', 'NotoSansCJK')
+
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.label import Label
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.widget import Widget
+from kivy.uix.anchorlayout import AnchorLayout
+from kivy.uix.floatlayout import FloatLayout
+from kivy.clock import Clock
+from kivy.core.window import Window
+from kivy.graphics import Color, RoundedRectangle
+from kivy.metrics import dp
+from kivy.animation import Animation
+from kivy.uix.popup import Popup
+from kivy.uix.button import Button
+from kivy.uix.textinput import TextInput
+import uuid
+
+# Import after config is set
+from kivy.core.text import LabelBase
+
+# Register fonts that support various scripts  
+# Try multiple font options in order of preference
+font_options = [
+    ('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', 'NotoSansCJK'),  # Noto Sans CJK for Asian languages
+    ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 'DejaVuSans'),  # DejaVu for broad Unicode support
+    ('/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', 'LiberationSans'),  # Liberation Sans
+    ('/System/Library/Fonts/PingFang.ttc', 'PingFang'),  # macOS Chinese font
+    ('/System/Library/Fonts/Helvetica.ttc', 'Helvetica'),  # macOS fallback
+    ('C:/Windows/Fonts/msyh.ttc', 'MicrosoftYaHei'),  # Windows Chinese font
+    ('C:/Windows/Fonts/arial.ttf', 'Arial'),  # Windows fallback
+]
+
+# Try to register a Unicode-supporting font
+font_loaded = False
+for font_path, font_name in font_options:
+    if os.path.exists(font_path):
+        try:
+            LabelBase.register(name=font_name, 
+                             fn_regular=font_path)
+            print(f"[INFO] Loaded Unicode font: {font_name} from {font_path}")
+            font_loaded = True
+            # Don't break - register all available fonts
+        except Exception as e:
+            print(f"[DEBUG] Failed to load font {font_path}: {e}")
+            continue
+
+if not font_loaded:
+    print("[WARNING] No Unicode font found. Chinese/Arabic text may not display correctly.")
+
+# Global font size
+CURRENT_FONT_SIZE = 30  # Default font size
+
+
+class MessageBubble(BoxLayout):
+    def __init__(self, text, role, language=None, message_id=None, **kwargs):
+        super().__init__(
+            size_hint=(None, None),
+            padding=[dp(15), dp(10)],
+            **kwargs
+        )
+        
+        self.role = role  # Store for later use
+        self.text = text  # Store original text
+        self.selected = False  # Track selection state
+        self.selection_start = None  # Track text selection
+        self.selection_end = None
+        self.language = language  # Store language for editing
+        self.message_id = message_id  # Unique ID for this message
+        self.is_editing = False  # Track edit mode
+        
+        # Calculate max width dynamically based on current window
+        # Account for padding, scrollbar, and panel division
+        panel_width = (Window.width - dp(40)) / 2  # Half window minus padding/scrollbar
+        max_text_width = max(dp(200), panel_width * 0.85)  # Use 85% of panel, min 200dp
+        
+        # Use Label for display
+        # Use the first available CJK font for proper Unicode support
+        font_to_use = 'NotoSansCJK' if 'NotoSansCJK' in LabelBase._fonts else None
+        if not font_to_use:
+            font_to_use = 'DejaVuSans' if 'DejaVuSans' in LabelBase._fonts else 'Roboto'
+            
+        self.label = Label(
+            text=text,
+            size_hint=(None, None),
+            font_size=dp(CURRENT_FONT_SIZE),
+            font_name=font_to_use,  # Use Unicode-supporting font
+            markup=True,
+            text_size=(max_text_width, None),  # Enable text wrapping
+            halign='left',
+            valign='top',
+            shorten=False  # Don't shorten text
+        )
+        
+        # Store text for copying
+        self.copyable_text = text
+        
+        # Bind to texture changes to update size
+        self.label.bind(texture_size=self._update_size)
+        
+        # Bind to window resize
+        Window.bind(size=self.on_window_resize)
+        
+        # Force initial texture update
+        self.label.texture_update()
+        self._update_size(self.label, self.label.texture_size)
+        
+        if role == 'original':
+            bg_color = (0.007, 0.533, 0.82, 1)  # Blue
+            self.label.color = (1, 1, 1, 1)
+        else:
+            bg_color = (0.9, 0.9, 0.92, 1)  # Gray
+            self.label.color = (0, 0, 0, 1)
+        
+        with self.canvas.before:
+            self.bg_color_instruction = Color(*bg_color)
+            self.bg_rect = RoundedRectangle(
+                size=self.size,
+                pos=self.pos,
+                radius=[dp(18)]
+            )
+        
+        # Store original color for selection toggle
+        self.original_bg_color = bg_color
+        
+        self.bind(size=self.update_bg, pos=self.update_bg)
+        self.add_widget(self.label)
+        
+        # Register triple-tap for copying full bubble text
+        self.register_event_type('on_triple_tap')
+        self.touches = []
+        self.touch_time = 0
+        
+        # Start with opacity 0 for fade-in
+        self.opacity = 0
+    
+    def on_touch_down(self, touch):
+        """Handle touch events for text selection and editing"""
+        if self.collide_point(*touch.pos):
+            # If already editing, don't process other actions
+            if self.is_editing:
+                return super().on_touch_down(touch)
+            
+            # Triple-tap detection for copying (check this first)
+            import time
+            current_time = time.time()
+            
+            if touch.is_double_tap:
+                # This is at least a double tap
+                if current_time - self.touch_time < 0.5:
+                    # Triple tap detected - copy text
+                    self.dispatch('on_triple_tap')
+                    return True
+            
+            self.touch_time = current_time
+            
+            # Check for modifier keys
+            from kivy.core.window import Window
+            modifiers = Window.modifiers
+            
+            # Ctrl+Click: Toggle selection for any bubble
+            if 'ctrl' in modifiers:
+                # Get parent panel for selection handling
+                parent = self.parent
+                while parent and not hasattr(parent, 'handle_bubble_click'):
+                    parent = parent.parent
+                
+                if parent and hasattr(parent, 'handle_bubble_click'):
+                    parent.handle_bubble_click(self, modifiers)
+                return True
+            
+            # Regular click on blue bubble starts edit mode
+            if self.role == 'original' and not touch.is_double_tap:
+                self.start_edit_mode()
+                return True
+            
+            # Regular click on gray bubble - do nothing
+            # Just consume the event
+            return True
+        return super().on_touch_down(touch)
+    
+    def start_edit_mode(self):
+        """Start editing this bubble"""
+        if self.role != 'original' or self.is_editing:
+            return
+        
+        self.is_editing = True
+        
+        # Replace label with TextInput
+        self.remove_widget(self.label)
+        
+        # Import needed modules
+        from kivy.uix.textinput import TextInput
+        from kivy.core.window import Window
+        from kivy.clock import Clock
+        
+        # Create edit input
+        self.edit_input = TextInput(
+            text=self.text,
+            multiline=False,  # Single line for Enter to submit
+            size_hint=(None, None),
+            font_size=self.label.font_size,
+            foreground_color=(1, 1, 1, 1) if self.role == 'original' else (0, 0, 0, 1),
+            background_color=(0, 0, 0, 0),  # Transparent background
+            cursor_color=(1, 1, 1, 1) if self.role == 'original' else (0, 0, 0, 1),
+            padding=[0, 0],
+            unfocus_on_touch=False  # IMPORTANT: Prevents losing focus when clicking
+        )
+        
+        # Copy size from label
+        panel_width = (Window.width - dp(40)) / 2
+        max_text_width = max(dp(200), panel_width * 0.85)
+        self.edit_input.text_size = (max_text_width, None)
+        self.edit_input.size = self.label.size
+        
+        # Bind events
+        self.edit_input.bind(on_text_validate=self.submit_edit)
+        
+        # Handle ESC key to cancel edit without saving
+        def on_key_down(window, key, scancode, codepoint, modifiers):
+            if key == 27:  # ESC key - cancel edit without saving
+                self.cancel_edit()
+                return True
+            return False
+        
+        self._edit_key_handler = on_key_down
+        Window.bind(on_key_down=self._edit_key_handler)
+        
+        # Set focus with a small delay to ensure widget is ready
+        Clock.schedule_once(lambda dt: setattr(self.edit_input, 'focus', True), 0.1)
+        
+        # Add visual indication of edit mode
+        self.bg_color_instruction.rgba = (0.005, 0.7, 1, 1)  # Lighter blue for edit mode
+        
+        self.add_widget(self.edit_input)
+    
+    def submit_edit(self, instance):
+        """Submit the edited text for re-translation"""
+        new_text = instance.text.strip()
+        
+        if new_text and new_text != self.text:
+            # Update the text
+            self.text = new_text
+            
+            # Get parent panel to handle re-translation
+            parent = self.parent
+            while parent and not hasattr(parent, 'handle_edit_submit'):
+                parent = parent.parent
+            
+            if parent and hasattr(parent, 'handle_edit_submit'):
+                parent.handle_edit_submit(self, new_text)
+        
+        self.end_edit_mode()
+    
+    def cancel_edit(self):
+        """Cancel editing without saving changes"""
+        if not self.is_editing:
+            return
+        
+        # Restore original text and exit edit mode
+        if hasattr(self, 'edit_input'):
+            self.edit_input.text = self.text  # Restore original text
+        self.end_edit_mode()
+    
+    def end_edit_mode(self):
+        """End editing and restore label"""
+        if not self.is_editing:
+            return
+        
+        self.is_editing = False
+        
+        # Unbind ESC key handler
+        if hasattr(self, '_edit_key_handler'):
+            from kivy.core.window import Window
+            Window.unbind(on_key_down=self._edit_key_handler)
+            del self._edit_key_handler
+        
+        # Remove edit input
+        if hasattr(self, 'edit_input'):
+            self.remove_widget(self.edit_input)
+            del self.edit_input
+        
+        # Update label with new text
+        self.label.text = self.text
+        self.label.texture_update()
+        self._update_size(self.label, self.label.texture_size)
+        
+        # Restore original background color
+        self.bg_color_instruction.rgba = self.original_bg_color
+        
+        # Add label back
+        self.add_widget(self.label)
+    
+    def on_triple_tap(self):
+        """Copy entire bubble text on triple tap"""
+        from kivy.core.clipboard import Clipboard
+        Clipboard.copy(self.text)
+        
+        # Show feedback
+        parent = self.parent
+        while parent and not hasattr(parent, 'status'):
+            parent = parent.parent
+        if parent and hasattr(parent, 'status'):
+            parent.status.text = "Copied message to clipboard"
+            Clock.schedule_once(lambda dt: setattr(parent.status, 'text', 
+                'Click blue to edit | Ctrl+Click to select | Enter to submit edit'), 2)
+    
+    def toggle_selection(self, selected):
+        """Toggle bubble selection state"""
+        self.selected = selected
+        if selected:
+            # Highlight background
+            if self.role == 'original':
+                self.bg_color_instruction.rgba = (0.005, 0.4, 0.7, 1)  # Darker blue
+            else:
+                self.bg_color_instruction.rgba = (0.7, 0.7, 0.75, 1)  # Darker gray
+        else:
+            # Restore original color
+            self.bg_color_instruction.rgba = self.original_bg_color
+    
+    def _update_size(self, instance, texture_size):
+        """Update bubble size based on text content"""
+        if texture_size[1] > 0:  # Has valid texture
+            # Recalculate based on current window size
+            panel_width = (Window.width - dp(40)) / 2
+            max_text_width = max(dp(200), panel_width * 0.85)
+            
+            # Update text wrapping if window changed
+            if abs(self.label.text_size[0] - max_text_width) > dp(10):
+                self.label.text_size = (max_text_width, None)
+                self.label.texture_update()
+                return  # Will trigger this method again
+            
+            self.label.size = (max_text_width, texture_size[1])
+            self.width = max_text_width + dp(25)
+            self.height = texture_size[1] + dp(20)
+    
+    def update_bg(self, *args):
+        self.bg_rect.size = self.size
+        self.bg_rect.pos = self.pos
+    
+    def update_font_size(self, new_size):
+        self.label.font_size = dp(new_size)
+        panel_width = (Window.width - dp(40)) / 2
+        max_text_width = max(dp(200), panel_width * 0.85)
+        self.label.text_size = (max_text_width, None)
+        self.label.texture_update()
+        self._update_size(self.label, self.label.texture_size)
+    
+    def on_window_resize(self, window, size):
+        """Handle window resize"""
+        width, height = size
+        # Recalculate bubble width for new window size
+        panel_width = (width - dp(40)) / 2
+        max_text_width = max(dp(200), panel_width * 0.85)
+        self.label.text_size = (max_text_width, None)
+        self.label.texture_update()
+
+
+class CustomScrollView(ScrollView):
+    """Custom ScrollView that doesn't steal focus from TextInput"""
+    
+    def on_touch_down(self, touch):
+        # Check if the touch is on a TextInput widget
+        # If it is, don't process the touch in ScrollView
+        from kivy.uix.textinput import TextInput
+        
+        # Find if touch collides with any TextInput
+        for widget in self.walk():
+            if isinstance(widget, TextInput) and widget.collide_point(*touch.pos):
+                # Let the TextInput handle it
+                return super().on_touch_down(touch)
+        
+        # Normal ScrollView behavior
+        return super().on_touch_down(touch)
+
+
+class ChatPanel(BoxLayout):
+    """Chat panel that behaves like iMessage - messages at bottom"""
+    
+    def __init__(self, language='en', **kwargs):
+        super().__init__(orientation='vertical', **kwargs)
+        self.selected_bubbles = []  # Track selected bubbles
+        self.last_selected = None  # For shift+click range selection
+        self.language = language  # 'en' or 'hr'
+        
+        # Create custom scroll view that won't steal focus
+        self.scroll_view = CustomScrollView(
+            size_hint=(1, 1),
+            do_scroll_x=False,
+            scroll_type=['bars', 'content'],
+            bar_width=dp(6),
+            bar_color=(0.3, 0.3, 0.4, 0.5),
+            bar_inactive_color=(0.2, 0.2, 0.3, 0.3),
+            always_overscroll=False
+        )
+        
+        # Create a float layout to contain everything
+        self.float_layout = FloatLayout(size_hint_y=None, height=Window.height)
+        
+        # Messages container - starts at bottom
+        self.messages_container = GridLayout(
+            cols=1,
+            spacing=dp(5),
+            size_hint=(1, None),
+            padding=[dp(10), dp(10)],  # Minimal side padding to maximize bubble width
+            pos_hint={'bottom': 1}  # Anchor to bottom
+        )
+        self.messages_container.bind(minimum_height=self.messages_container.setter('height'))
+        
+        # Add messages to float layout
+        self.float_layout.add_widget(self.messages_container)
+        
+        # Add float layout to scroll view
+        self.scroll_view.add_widget(self.float_layout)
+        self.add_widget(self.scroll_view)
+        
+        self.bubbles = []
+        self.message_count = 0
+        
+        # Start at bottom
+        Clock.schedule_once(lambda dt: setattr(self.scroll_view, 'scroll_y', 0), 0)
+        
+        # Add text input field at bottom
+        self.add_text_input()
+    
+    def add_message(self, text, role, message_id=None):
+        """Add a message bubble to the panel"""
+        # Store current focus state
+        had_focus = hasattr(self, 'text_input') and self.text_input.focus
+        
+        # Create container for alignment
+        container = BoxLayout(
+            size_hint=(1, None),
+            padding=[dp(5), dp(2)]  # Minimal padding to let bubbles be wider
+        )
+        
+        # Generate message ID if not provided
+        if message_id is None:
+            import uuid
+            message_id = str(uuid.uuid4())
+        
+        # Create bubble with language and ID
+        bubble = MessageBubble(text, role, language=self.language, message_id=message_id)
+        self.bubbles.append(bubble)
+        container.message_id = message_id  # Store ID on container too
+        
+        # Update container height based on bubble
+        container.height = bubble.height + dp(10)
+        container.bubble = bubble
+        
+        if role == 'original':
+            container.add_widget(Widget())  # Spacer left
+            container.add_widget(bubble)
+        else:
+            container.add_widget(bubble)
+            container.add_widget(Widget())  # Spacer right
+        
+        # Add to messages
+        self.messages_container.add_widget(container)
+        self.message_count += 1
+        
+        # Update float layout height if needed
+        total_height = self.messages_container.height + dp(100)
+        if total_height > Window.height:
+            self.float_layout.height = total_height
+        
+        # Animate bubble appearance
+        Animation(opacity=1, duration=0.3).start(bubble)
+        
+        # Always scroll to bottom for new messages
+        Clock.schedule_once(self.scroll_to_bottom, 0.1)
+        
+        # Restore focus if the text input had it
+        if had_focus:
+            Clock.schedule_once(lambda dt: setattr(self.text_input, 'focus', True), 0.15)
+    
+    def scroll_to_bottom(self, dt=None):
+        """Scroll to bottom smoothly"""
+        Animation(scroll_y=0, duration=0.2).start(self.scroll_view)
+    
+    def update_all_font_sizes(self, new_size):
+        """Update font size for all bubbles"""
+        for bubble in self.bubbles:
+            bubble.update_font_size(new_size)
+        # Update container heights
+        for child in self.messages_container.children:
+            if hasattr(child, 'bubble'):
+                child.height = child.bubble.height + dp(10)
+    
+    def handle_bubble_click(self, bubble, modifiers):
+        """Handle bubble click with modifiers"""
+        # Only handle Ctrl+click for toggle selection
+        if 'ctrl' in modifiers:
+            # Ctrl+click: toggle selection
+            self.toggle_bubble_selection(bubble)
+            self.last_selected = bubble
+            self.update_selection_status()
+    
+    def select_bubble(self, bubble):
+        """Select a single bubble"""
+        if bubble not in self.selected_bubbles:
+            bubble.toggle_selection(True)
+            self.selected_bubbles.append(bubble)
+    
+    def toggle_bubble_selection(self, bubble):
+        """Toggle bubble selection"""
+        if bubble in self.selected_bubbles:
+            bubble.toggle_selection(False)
+            self.selected_bubbles.remove(bubble)
+        else:
+            bubble.toggle_selection(True)
+            self.selected_bubbles.append(bubble)
+    
+    def select_range(self, start_bubble, end_bubble):
+        """Select range of bubbles"""
+        start_idx = self.bubbles.index(start_bubble) if start_bubble in self.bubbles else -1
+        end_idx = self.bubbles.index(end_bubble) if end_bubble in self.bubbles else -1
+        
+        if start_idx >= 0 and end_idx >= 0:
+            for i in range(min(start_idx, end_idx), max(start_idx, end_idx) + 1):
+                self.select_bubble(self.bubbles[i])
+    
+    def select_all(self):
+        """Select all bubbles"""
+        for bubble in self.bubbles:
+            self.select_bubble(bubble)
+    
+    def clear_selection(self):
+        """Clear all selections"""
+        for bubble in self.selected_bubbles:
+            bubble.toggle_selection(False)
+        self.selected_bubbles = []
+    
+    def copy_selected(self):
+        """Copy selected bubble text to clipboard"""
+        if not self.selected_bubbles:
+            return False
+        
+        # Sort by order in list
+        sorted_bubbles = sorted(self.selected_bubbles, key=lambda b: self.bubbles.index(b))
+        texts = [bubble.text for bubble in sorted_bubbles]
+        
+        combined_text = "\n\n".join(texts)
+        
+        from kivy.core.clipboard import Clipboard
+        Clipboard.copy(combined_text)
+        
+        # Copy successful
+        
+        return True
+    
+    def update_selection_status(self):
+        """Update status bar with selection info"""
+        if self.selected_bubbles:
+            # Find main GUI
+            parent = self.parent
+            while parent and not hasattr(parent, 'status'):
+                parent = parent.parent
+            
+            if parent and hasattr(parent, 'status'):
+                count = len(self.selected_bubbles)
+                parent.status.text = f"{count} message{'s' if count > 1 else ''} selected | Ctrl+C to copy"
+    
+    def handle_edit_submit(self, bubble, new_text):
+        """Handle when a bubble's text is edited and needs re-translation"""
+        # Get parent GUI to handle translation
+        parent = self.parent
+        while parent and not hasattr(parent, 'retranslate_message'):
+            parent = parent.parent
+        
+        if parent and hasattr(parent, 'retranslate_message'):
+            # Pass the bubble and new text to the parent GUI
+            # The parent will handle finding and removing the old translation
+            parent.retranslate_message(bubble, new_text, None)
+    
+    def add_text_input(self):
+        """Add text input field at bottom of panel"""
+        # Container for input field
+        input_container = BoxLayout(
+            size_hint=(1, None),
+            height=dp(50),
+            padding=[dp(10), dp(5)],
+            spacing=dp(5)
+        )
+        
+        # Text input field
+        # Start with English placeholder, will be translated after initialization
+        placeholder = "Type to translate..."
+        
+        # Use Unicode-supporting font
+        font_to_use = 'NotoSansCJK' if 'NotoSansCJK' in LabelBase._fonts else None
+        if not font_to_use:
+            font_to_use = 'DejaVuSans' if 'DejaVuSans' in LabelBase._fonts else 'Roboto'
+            
+        self.text_input = TextInput(
+            multiline=False,
+            hint_text=placeholder,
+            size_hint=(0.85, 1),
+            font_size=dp(16),
+            font_name=font_to_use,  # Use Unicode font for input field
+            background_color=(0.15, 0.15, 0.2, 1),
+            foreground_color=(0.9, 0.9, 0.95, 1),
+            cursor_color=(0.5, 0.7, 1, 1),
+            padding=[dp(10), dp(10)],
+            unfocus_on_touch=False  # Prevent losing focus when clicking elsewhere
+        )
+        self.text_input.bind(on_text_validate=self.on_text_submit)
+        
+        # Send button
+        send_btn = Button(
+            text='Send',
+            size_hint=(0.15, 1),
+            font_size=dp(14),
+            background_color=(0.007, 0.533, 0.82, 1)
+        )
+        send_btn.bind(on_press=lambda x: self.on_text_submit(self.text_input))
+        
+        input_container.add_widget(self.text_input)
+        input_container.add_widget(send_btn)
+        
+        # Add to panel
+        self.add_widget(input_container)
+    
+    def on_text_submit(self, instance):
+        """Handle text submission for translation"""
+        text = instance.text.strip()
+        if not text:
+            return
+        
+        # Clear input
+        instance.text = ''
+        
+        # Keep focus on the input field
+        instance.focus = True
+        
+        # Get parent GUI to handle translation
+        parent = self.parent
+        while parent and not hasattr(parent, 'translate_text'):
+            parent = parent.parent
+        
+        if parent and hasattr(parent, 'translate_text'):
+            parent.translate_text(text, self.language)
+
+
+class StreamGUI(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(orientation='vertical', **kwargs)
+        
+        # Initialize language settings from the FIRST JSON message (config)
+        # The translate-stream.sh script ALWAYS sends config as the first message
+        self.primary_language = 'en'  # Will be immediately overridden by config
+        self.foreign_language = 'hr'  # Will be immediately overridden by config
+        
+        # Read the first line from stdin which MUST be the config
+        import sys
+        first_line = sys.stdin.readline()
+        if first_line:
+            try:
+                config = json.loads(first_line.strip())
+                if config.get('type') == 'config':
+                    self.primary_language = config.get('primary_language', 'en')
+                    self.foreign_language = config.get('foreign_language', 'hr')
+                    self.primary_language_name = config.get('primary_language_name', 'English')
+                    self.foreign_language_name = config.get('foreign_language_name', 'Croatian')
+                    print(f"[INFO] Loaded config: primary={self.primary_language} ({self.primary_language_name}), foreign={self.foreign_language} ({self.foreign_language_name})")
+            except json.JSONDecodeError:
+                print(f"[WARNING] First line was not valid JSON config: {first_line}")
+                pass
+        else:
+            # Fallback if no config received
+            self.primary_language_name = 'English'
+            self.foreign_language_name = 'Croatian'
+        
+        Window.bind(on_key_down=self.on_keyboard_down)
+        Window.bind(size=self.on_window_resize)
+        self.message_queue = Queue()
+        self.all_messages = []  # Store all messages for export
+        
+        # Title bar with better styling and save button
+        title_bar = BoxLayout(
+            size_hint=(1, None), 
+            height=dp(60),
+            padding=[dp(10), dp(10)],
+            spacing=dp(10)
+        )
+        
+        # Create title background
+        with title_bar.canvas.before:
+            Color(0.08, 0.08, 0.12, 1)
+            self.title_bg = RoundedRectangle(
+                size=title_bar.size,
+                pos=title_bar.pos,
+                radius=[dp(10), dp(10), 0, 0]
+            )
+        title_bar.bind(
+            size=lambda *x: setattr(self.title_bg, 'size', title_bar.size),
+            pos=lambda *x: setattr(self.title_bg, 'pos', title_bar.pos)
+        )
+        
+        # Save button on the left
+        save_btn = Button(
+            text='Save',
+            size_hint=(None, None),
+            width=dp(60),
+            height=dp(40),
+            font_size=dp(14),
+            background_color=(0.2, 0.2, 0.3, 1)
+        )
+        save_btn.bind(on_press=lambda x: self.show_export_dialog())
+        title_bar.add_widget(save_btn)
+        
+        # Language labels - use the languages from JSON config
+        # Use Unicode-supporting font for title labels
+        font_to_use = 'NotoSansCJK' if 'NotoSansCJK' in LabelBase._fonts else None
+        if not font_to_use:
+            font_to_use = 'DejaVuSans' if 'DejaVuSans' in LabelBase._fonts else 'Roboto'
+        
+        # Get language names and flags from config
+        flag_map = {
+            'en': '🇺🇸', 'es': '🇪🇸', 'fr': '🇫🇷', 'de': '🇩🇪', 'it': '🇮🇹',
+            'pt': '🇵🇹', 'nl': '🇳🇱', 'el': '🇬🇷', 'hr': '🇭🇷', 'sr': '🇷🇸',
+            'bg': '🇧🇬', 'ro': '🇷🇴', 'hu': '🇭🇺', 'cs': '🇨🇿', 'sk': '🇸🇰',
+            'pl': '🇵🇱', 'sv': '🇸🇪', 'no': '🇳🇴', 'da': '🇩🇰', 'fi': '🇫🇮',
+            'zh': '🇨🇳', 'ja': '🇯🇵', 'ko': '🇰🇷', 'ar': '🇸🇦', 'he': '🇮🇱',
+            'tr': '🇹🇷', 'th': '🇹🇭', 'vi': '🇻🇳', 'id': '🇮🇩', 'ru': '🇷🇺'
+        }
+        
+        # Skip flags - just use language names
+        self.en_title_label = Label(
+            text=f'[b]{self.primary_language_name}[/b]',
+            markup=True,
+            font_size=dp(20),
+            font_name=font_to_use,
+            color=(0.9, 0.9, 0.95, 1)
+        )
+        self.hr_title_label = Label(
+            text=f'[b]{self.foreign_language_name}[/b]',
+            markup=True,
+            font_size=dp(20),
+            font_name=font_to_use,
+            color=(0.9, 0.9, 0.95, 1)
+        )
+        title_bar.add_widget(self.en_title_label)
+        title_bar.add_widget(self.hr_title_label)
+        self.add_widget(title_bar)
+        
+        # Chat panels container
+        panels = BoxLayout(
+            orientation='horizontal', 
+            spacing=dp(2),
+            padding=[dp(5), 0, dp(5), 0]
+        )
+        
+        # English panel with background container
+        self.en_panel_container = BoxLayout()
+        with self.en_panel_container.canvas.before:
+            Color(0.05, 0.05, 0.08, 1)
+            self.en_bg = RoundedRectangle(
+                size=self.en_panel_container.size,
+                pos=self.en_panel_container.pos,
+                radius=[0, 0, dp(8), dp(8)]
+            )
+        self.en_panel_container.bind(
+            size=lambda *x: setattr(self.en_bg, 'size', self.en_panel_container.size),
+            pos=lambda *x: setattr(self.en_bg, 'pos', self.en_panel_container.pos)
+        )
+        
+        self.en_panel = ChatPanel(language=self.primary_language)
+        self.en_panel_container.add_widget(self.en_panel)
+        
+        # Croatian panel with background container
+        self.hr_panel_container = BoxLayout()
+        with self.hr_panel_container.canvas.before:
+            Color(0.05, 0.05, 0.08, 1)
+            self.hr_bg = RoundedRectangle(
+                size=self.hr_panel_container.size,
+                pos=self.hr_panel_container.pos,
+                radius=[0, 0, dp(8), dp(8)]
+            )
+        self.hr_panel_container.bind(
+            size=lambda *x: setattr(self.hr_bg, 'size', self.hr_panel_container.size),
+            pos=lambda *x: setattr(self.hr_bg, 'pos', self.hr_panel_container.pos)
+        )
+        
+        self.hr_panel = ChatPanel(language=self.foreign_language)
+        self.hr_panel_container.add_widget(self.hr_panel)
+        
+        panels.add_widget(self.en_panel_container)
+        panels.add_widget(self.hr_panel_container)
+        self.add_widget(panels)
+        
+        # Translate the placeholder text for the foreign language input
+        if self.foreign_language != 'en':
+            try:
+                import sys
+                from pathlib import Path
+                src_path = str(Path(__file__).parent / 'src')
+                if src_path not in sys.path:
+                    sys.path.insert(0, src_path)
+                from transcribe.text_translator import TextTranslator
+                
+                # Create translator with configured languages and names
+                translator = TextTranslator(
+                    primary_language=self.primary_language,
+                    foreign_language=self.foreign_language,
+                    primary_language_name=self.primary_language_name,
+                    foreign_language_name=self.foreign_language_name
+                )
+                
+                # Translate the placeholder
+                translated_placeholder, _, _ = translator.translate(
+                    "Type to translate...",
+                    source_lang='en',
+                    target_lang=self.foreign_language
+                )
+                
+                # Update the foreign language input placeholder
+                self.hr_panel.text_input.hint_text = translated_placeholder
+                print(f"[INFO] Set {self.foreign_language} placeholder: {translated_placeholder}")
+                
+            except Exception as e:
+                print(f"[WARNING] Could not translate placeholder: {e}")
+                # Keep English placeholder as fallback
+        
+        # Status bar
+        self.status = Label(
+            text='Click to select | Shift+click for range | Triple-tap to copy | Ctrl+/- zoom',
+            size_hint=(1, None),
+            height=dp(30),
+            font_size=dp(11),
+            color=(0.6, 0.6, 0.7, 1)
+        )
+        self.add_widget(self.status)
+        
+        self.start_reader()
+        Clock.schedule_interval(self.process_queue, 1/60)  # 60 FPS
+        
+        # Initialize text translator (lazy load)
+        self.translator = None
+    
+    def start_reader(self):
+        def read_stdin():
+            for line in sys.stdin:
+                try:
+                    data = json.loads(line.strip())
+                    self.message_queue.put(data)
+                except:
+                    pass
+        
+        thread = threading.Thread(target=read_stdin, daemon=True)
+        thread.start()
+    
+    def process_queue(self, dt):
+        """Process messages from queue without blocking"""
+        if not self.message_queue.empty():
+            try:
+                msg = self.message_queue.get_nowait()
+                self.add_message(msg)
+            except:
+                pass
+    
+    def add_message(self, msg):
+        # Handle config messages first
+        if msg.get('type') == 'config':
+            # Skip config updates - we already processed it at startup
+            # The config was read from stdin before GUI creation
+            print(f"[INFO] Skipping duplicate config message - already processed at startup")
+            return
+            
+        if msg.get('type') != 'completed':
+            return
+        
+        text = msg.get('text', '').strip()
+        if not text:
+            return
+        
+        language = msg.get('language', 'en')
+        role = msg.get('role', 'original')
+        message_id = msg.get('message_id', None)  # Get message_id if provided
+        
+        # Store message with metadata for export
+        self.all_messages.append({
+            'timestamp': datetime.now().isoformat(),
+            'text': text,
+            'language': language,
+            'role': role
+        })
+        
+        # Route to correct panel based on actual configured languages
+        if language == self.primary_language:
+            self.en_panel.add_message(text, role, message_id)
+        elif language == self.foreign_language:
+            self.hr_panel.add_message(text, role, message_id)
+    
+    def update_language_config(self, config):
+        """Update GUI based on language configuration from JSON stream"""
+        # Process config message
+        
+        # Get languages from config - these override any defaults
+        new_primary = config.get('primary_language', 'en')
+        new_foreign = config.get('foreign_language', 'hr')
+        
+        # Only update if languages actually changed
+        if new_primary == self.primary_language and new_foreign == self.foreign_language:
+            print(f"[INFO] Config received but languages unchanged: primary={new_primary}, foreign={new_foreign}")
+            return
+            
+        self.primary_language = new_primary
+        self.foreign_language = new_foreign
+        primary_name = config.get('primary_language_name', 'English')
+        foreign_name = config.get('foreign_language_name', 'Croatian')
+        
+        # Update language configuration
+        
+        # Update panel languages
+        self.en_panel.language = self.primary_language
+        self.hr_panel.language = self.foreign_language
+        
+        # Reset translator so it gets recreated with new languages
+        self.translator = None
+        
+        # Get flag emojis
+        flag_map = {
+            'en': '🇺🇸', 'es': '🇪🇸', 'fr': '🇫🇷', 'de': '🇩🇪', 'it': '🇮🇹',
+            'pt': '🇵🇹', 'nl': '🇳🇱', 'el': '🇬🇷', 'hr': '🇭🇷', 'sr': '🇷🇸',
+            'bg': '🇧🇬', 'ro': '🇷🇴', 'hu': '🇭🇺', 'cs': '🇨🇿', 'sk': '🇸🇰',
+            'pl': '🇵🇱', 'sv': '🇸🇪', 'no': '🇳🇴', 'da': '🇩🇰', 'fi': '🇫🇮',
+            'zh': '🇨🇳', 'ja': '🇯🇵', 'ko': '🇰🇷', 'ar': '🇸🇦', 'he': '🇮🇱',
+            'tr': '🇹🇷', 'th': '🇹🇭', 'vi': '🇻🇳', 'id': '🇮🇩', 'ru': '🇷🇺'
+        }
+        
+        # Update title labels - no flags, just names
+        self.en_title_label.text = f'[b]{primary_name}[/b]'
+        self.hr_title_label.text = f'[b]{foreign_name}[/b]'
+        
+        # Force label refresh
+        self.en_title_label.texture_update()
+        self.hr_title_label.texture_update()
+        
+        # Update text input placeholders
+        # Use fallback translations (OpenAI would need API key)
+        fallback = {
+            'el': 'Πληκτρολογήστε για μετάφραση...',
+            'hr': 'Upišite za prijevod...',
+            'es': 'Escriba para traducir...',
+            'fr': 'Tapez pour traduire...',
+            'de': 'Zum Übersetzen eingeben...',
+            'it': 'Digita per tradurre...',
+            'pt': 'Digite para traduzir...',
+            'nl': 'Typ om te vertalen...',
+            'ru': 'Введите для перевода...',
+            'ja': '翻訳するには入力...',
+            'zh': '输入以翻译...',
+            'ko': '번역하려면 입력...',
+            'ar': 'اكتب للترجمة...',
+        }
+        
+        # Update primary language input
+        if self.primary_language == 'en':
+            self.en_panel.text_input.hint_text = "Type to translate..."
+        elif self.primary_language in fallback:
+            self.en_panel.text_input.hint_text = fallback[self.primary_language]
+        else:
+            self.en_panel.text_input.hint_text = "Type to translate..."
+            
+        # Update foreign language input  
+        if self.foreign_language in fallback:
+            self.hr_panel.text_input.hint_text = fallback[self.foreign_language]
+        else:
+            self.hr_panel.text_input.hint_text = "Type to translate..."
+        
+        # Language configuration updated successfully
+    
+    def on_keyboard_down(self, window, key, scancode, codepoint, modifiers):
+        global CURRENT_FONT_SIZE
+        
+        # Check if ANY text input is focused (including edit mode)
+        text_input_focused = (self.en_panel.text_input.focus or self.hr_panel.text_input.focus)
+        
+        # Check if any bubble is in edit mode
+        edit_mode_active = False
+        for bubble in self.en_panel.bubbles + self.hr_panel.bubbles:
+            if bubble.is_editing:
+                edit_mode_active = True
+                break
+        
+        # Don't handle keyboard shortcuts if text is being edited
+        if text_input_focused or edit_mode_active:
+            # Only handle Ctrl combinations when text input is focused
+            if 'ctrl' not in modifiers:
+                return False
+        
+        if 'ctrl' in modifiers:
+            if codepoint == '=' or codepoint == '+':
+                CURRENT_FONT_SIZE = min(CURRENT_FONT_SIZE + 2, 40)
+                self.update_font_sizes()
+                self.status.text = f"Font size: {CURRENT_FONT_SIZE}"
+                Clock.schedule_once(lambda dt: setattr(self.status, 'text', 
+                    'Ctrl+ zoom in | Ctrl- zoom out | Ctrl+0 reset'), 2)
+                return True
+            elif codepoint == '-':
+                CURRENT_FONT_SIZE = max(CURRENT_FONT_SIZE - 2, 10)
+                self.update_font_sizes()
+                self.status.text = f"Font size: {CURRENT_FONT_SIZE}"
+                Clock.schedule_once(lambda dt: setattr(self.status, 'text', 
+                    'Ctrl+ zoom in | Ctrl- zoom out | Ctrl+0 reset'), 2)
+                return True
+            elif codepoint == '0':
+                CURRENT_FONT_SIZE = 30
+                self.update_font_sizes()
+                self.status.text = f"Font size reset: {CURRENT_FONT_SIZE}"
+                Clock.schedule_once(lambda dt: setattr(self.status, 'text', 
+                    'Click to select | Shift+click for range | Ctrl+click to toggle | Ctrl+C to copy'), 2)
+                return True
+            elif codepoint == 'c':
+                # Copy selected text (Ctrl+C)
+                all_texts = []
+                
+                # Get selected texts from both panels
+                if self.en_panel.selected_bubbles:
+                    sorted_en = sorted(self.en_panel.selected_bubbles, 
+                                     key=lambda b: self.en_panel.bubbles.index(b))
+                    all_texts.extend([bubble.text for bubble in sorted_en])
+                
+                if self.hr_panel.selected_bubbles:
+                    sorted_hr = sorted(self.hr_panel.selected_bubbles,
+                                     key=lambda b: self.hr_panel.bubbles.index(b))
+                    all_texts.extend([bubble.text for bubble in sorted_hr])
+                
+                if all_texts:
+                    from kivy.core.clipboard import Clipboard
+                    # Join with just a space between messages
+                    final_text = " ".join(all_texts)
+                    Clipboard.copy(final_text)
+                    
+                    total = len(all_texts)
+                    self.status.text = f"Copied {total} messages to clipboard"
+                    Clock.schedule_once(lambda dt: setattr(self.status, 'text', 
+                        'Click to select | Shift+click for range | Ctrl+click to toggle'), 2)
+                    
+                    # Copy successful
+                    return True
+                
+                return False
+            elif codepoint == 's':
+                # Save/Export chat (Ctrl+S)
+                self.show_export_dialog()
+                return True
+            elif codepoint == 'a':
+                # Select all (Ctrl+A)
+                self.en_panel.select_all()
+                self.hr_panel.select_all()
+                
+                total = len(self.en_panel.selected_bubbles) + len(self.hr_panel.selected_bubbles)
+                self.status.text = f"Selected {total} messages | Ctrl+C to copy"
+                return True
+        # Escape key to clear selection
+        elif key == 27:  # ESC key
+            # Don't handle ESC if any bubble is in edit mode (let bubble handle it)
+            for bubble in self.en_panel.bubbles + self.hr_panel.bubbles:
+                if bubble.is_editing:
+                    return False  # Let the bubble's ESC handler work
+            
+            # Clear all selections
+            self.en_panel.clear_selection()
+            self.hr_panel.clear_selection()
+            
+            self.status.text = 'Selection cleared'
+            Clock.schedule_once(lambda dt: setattr(self.status, 'text', 
+                'Click to select | Shift+click for range | Ctrl+click to toggle'), 2)
+            return True
+        return False
+    
+    def update_font_sizes(self):
+        self.en_panel.update_all_font_sizes(CURRENT_FONT_SIZE)
+        self.hr_panel.update_all_font_sizes(CURRENT_FONT_SIZE)
+    
+    def on_window_resize(self, window, size):
+        """Handle window resize events"""
+        # Force all bubbles to recalculate their size
+        self.en_panel.update_all_font_sizes(CURRENT_FONT_SIZE)
+        self.hr_panel.update_all_font_sizes(CURRENT_FONT_SIZE)
+    
+    def show_export_dialog(self):
+        """Show dialog to select export format"""
+        if not self.all_messages:
+            self.status.text = "No messages to export"
+            Clock.schedule_once(lambda dt: setattr(self.status, 'text', 
+                'Click to select | Shift+click for range | Ctrl+S to export'), 2)
+            return
+        
+        # Create popup with format options
+        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
+        
+        # Add format buttons
+        json_btn = Button(text='Export as JSON', size_hint=(1, None), height=dp(50))
+        json_btn.bind(on_press=lambda x: self.export_chat('json', popup))
+        
+        txt_btn = Button(text='Export as Text', size_hint=(1, None), height=dp(50))
+        txt_btn.bind(on_press=lambda x: self.export_chat('txt', popup))
+        
+        html_btn = Button(text='Export as HTML', size_hint=(1, None), height=dp(50))
+        html_btn.bind(on_press=lambda x: self.export_chat('html', popup))
+        
+        cancel_btn = Button(text='Cancel', size_hint=(1, None), height=dp(50))
+        cancel_btn.bind(on_press=lambda x: popup.dismiss())
+        
+        content.add_widget(Label(text='Select Export Format', font_size=dp(16)))
+        content.add_widget(json_btn)
+        content.add_widget(txt_btn)
+        content.add_widget(html_btn)
+        content.add_widget(cancel_btn)
+        
+        popup = Popup(title='Export Chat', content=content, 
+                     size_hint=(0.4, 0.5), auto_dismiss=True)
+        popup.open()
+    
+    def export_chat(self, format_type, popup):
+        """Export chat in the selected format"""
+        popup.dismiss()
+        
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'chat_export_{timestamp}.{format_type}'
+        
+        try:
+            if format_type == 'json':
+                self.export_as_json(filename)
+            elif format_type == 'txt':
+                self.export_as_text(filename)
+            elif format_type == 'html':
+                self.export_as_html(filename)
+            
+            # Get absolute path for display
+            abs_path = os.path.abspath(filename)
+            self.status.text = f"Exported to {abs_path}"
+            Clock.schedule_once(lambda dt: setattr(self.status, 'text', 
+                'Click to select | Shift+click for range | Ctrl+S to export'), 4)
+        except Exception as e:
+            self.status.text = f"Export failed: {str(e)}"
+            Clock.schedule_once(lambda dt: setattr(self.status, 'text', 
+                'Click to select | Shift+click for range | Ctrl+S to export'), 3)
+    
+    def export_as_json(self, filename):
+        """Export chat as JSON file"""
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(self.all_messages, f, ensure_ascii=False, indent=2)
+    
+    def export_as_text(self, filename):
+        """Export chat as plain text file"""
+        with open(filename, 'w', encoding='utf-8') as f:
+            i = 0
+            while i < len(self.all_messages):
+                msg = self.all_messages[i]
+                timestamp = msg['timestamp'].split('T')[1].split('.')[0]  # Just time
+                lang = 'EN' if msg['language'] == 'en' else 'HR'
+                role = 'Original' if msg['role'] == 'original' else 'Translation'
+                f.write(f"[{timestamp}] {lang} ({role}): {msg['text']}\n")
+                
+                # Check if next message is the translation pair
+                if i + 1 < len(self.all_messages):
+                    next_msg = self.all_messages[i + 1]
+                    if next_msg['role'] != msg['role']:  # It's a translation pair
+                        next_timestamp = next_msg['timestamp'].split('T')[1].split('.')[0]
+                        next_lang = 'EN' if next_msg['language'] == 'en' else 'HR'
+                        next_role = 'Original' if next_msg['role'] == 'original' else 'Translation'
+                        f.write(f"[{next_timestamp}] {next_lang} ({next_role}): {next_msg['text']}\n\n")
+                        i += 2  # Skip the next message since we already wrote it
+                    else:
+                        f.write("\n")  # Single message, add one newline
+                        i += 1
+                else:
+                    f.write("\n")  # Last message
+                    i += 1
+    
+    def export_as_html(self, filename):
+        """Export chat as HTML file with styling similar to GUI"""
+        html_content = '''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Translation Chat Export</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #1a1a1a;
+            color: #fff;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            display: flex;
+            max-width: 1200px;
+            margin: 0 auto;
+            gap: 10px;
+        }
+        .panel {
+            flex: 1;
+            background: #0d0d14;
+            border-radius: 8px;
+            padding: 20px;
+        }
+        .panel h2 {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .message {
+            margin: 10px 0;
+            display: flex;
+        }
+        .message.original { justify-content: flex-end; }
+        .message.translation { justify-content: flex-start; }
+        .bubble {
+            max-width: 85%;
+            padding: 10px 15px;
+            border-radius: 18px;
+            word-wrap: break-word;
+        }
+        .original .bubble {
+            background: #0188d1;
+            color: white;
+        }
+        .translation .bubble {
+            background: #e6e6eb;
+            color: black;
+        }
+        .timestamp {
+            font-size: 0.8em;
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="panel">
+            <h2>🇺🇸 English</h2>
+'''
+        
+        # Add English messages
+        for msg in self.all_messages:
+            if msg['language'] == 'en':
+                role_class = msg['role']
+                timestamp = msg['timestamp'].split('T')[1].split('.')[0]
+                html_content += f'''            <div class="message {role_class}">
+                <div class="bubble">
+                    {msg['text']}
+                    <div class="timestamp">{timestamp}</div>
+                </div>
+            </div>\n'''
+        
+        html_content += '''        </div>
+        <div class="panel">
+            <h2>🇭🇷 Hrvatski</h2>
+'''
+        
+        # Add Croatian messages
+        for msg in self.all_messages:
+            if msg['language'] == 'hr':
+                role_class = msg['role']
+                timestamp = msg['timestamp'].split('T')[1].split('.')[0]
+                html_content += f'''            <div class="message {role_class}">
+                <div class="bubble">
+                    {msg['text']}
+                    <div class="timestamp">{timestamp}</div>
+                </div>
+            </div>\n'''
+        
+        html_content += '''        </div>
+    </div>
+</body>
+</html>'''
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+    
+    def retranslate_message(self, original_bubble, new_text, translation_bubble):
+        """Re-translate an edited message"""
+        # Update the original bubble's text (already done in bubble)
+        
+        # Translate the new text
+        if self.translator is None:
+            try:
+                # Import and initialize translator
+                import sys
+                # Add parent src directory to path
+                src_path = str(Path(__file__).parent / 'src')
+                if src_path not in sys.path:
+                    sys.path.insert(0, src_path)
+                from transcribe.text_translator import TextTranslator
+                # Create translator with current configured languages and names
+                self.translator = TextTranslator(
+                    primary_language=self.primary_language,
+                    foreign_language=self.foreign_language,
+                    primary_language_name=self.primary_language_name,
+                    foreign_language_name=self.foreign_language_name
+                )
+            except Exception as e:
+                self.status.text = f"Translation error: {str(e)}"
+                return
+        
+        try:
+            # Get translation
+            result = self.translator.translate_for_gui(new_text, original_bubble.language)
+            
+            # Find the target panel for the translation
+            target_panel = self.hr_panel if original_bubble.language == self.primary_language else self.en_panel
+            
+            # Find existing translation bubble with the same message_id and update it in place
+            translation_found = False
+            
+            for container in target_panel.messages_container.children:
+                if (hasattr(container, 'message_id') and 
+                    container.message_id == original_bubble.message_id and
+                    hasattr(container, 'bubble') and 
+                    container.bubble.role == 'translation'):
+                    # Found the translation - update it in place
+                    translation_found = True
+                    old_bubble = container.bubble
+                    
+                    # Update the bubble's text and label
+                    old_bubble.text = result['translation']['text']
+                    old_bubble.label.text = result['translation']['text']
+                    old_bubble.label.texture_update()
+                    
+                    # Force the bubble to recalculate its size
+                    old_bubble._update_size(old_bubble.label, old_bubble.label.texture_size)
+                    
+                    # Update container height
+                    container.height = old_bubble.height + dp(10)
+                    
+                    # Translation updated successfully
+                    break
+            
+            if not translation_found:
+                # No existing translation, add a new one
+                target_panel.add_message(
+                    result['translation']['text'],
+                    'translation',
+                    message_id=original_bubble.message_id
+                )
+            
+            self.status.text = "Message updated and re-translated"
+            Clock.schedule_once(lambda dt: setattr(self.status, 'text',
+                'Click blue bubbles to edit | Type to translate | Ctrl+S to export'), 2)
+                
+        except Exception as e:
+            self.status.text = f"Re-translation failed: {str(e)}"
+            Clock.schedule_once(lambda dt: setattr(self.status, 'text',
+                'Click blue bubbles to edit | Type to translate | Ctrl+S to export'), 3)
+    
+    def translate_text(self, text, source_language):
+        """Translate typed text and display in panels"""
+        # Lazy load translator
+        if self.translator is None:
+            try:
+                # Import and initialize translator
+                import sys
+                # Add parent src directory to path
+                src_path = str(Path(__file__).parent / 'src')
+                if src_path not in sys.path:
+                    sys.path.insert(0, src_path)
+                from transcribe.text_translator import TextTranslator
+                # Create translator with current configured languages and names
+                self.translator = TextTranslator(
+                    primary_language=self.primary_language,
+                    foreign_language=self.foreign_language,
+                    primary_language_name=self.primary_language_name,
+                    foreign_language_name=self.foreign_language_name
+                )
+            except Exception as e:
+                # Show error in status
+                self.status.text = f"Translation error: {str(e)}"
+                pass  # Translator not available
+                return
+        
+        try:
+            # Get translation
+            result = self.translator.translate_for_gui(text, source_language)
+            
+            # Generate a shared message ID for the pair
+            import uuid
+            shared_message_id = str(uuid.uuid4())
+            
+            # Create message format similar to voice transcription
+            original_msg = {
+                'type': 'completed',
+                'text': result['original']['text'],
+                'language': result['original']['language'],
+                'role': result['original']['role'],
+                'message_id': shared_message_id  # Share the same ID
+            }
+            
+            translation_msg = {
+                'type': 'completed',
+                'text': result['translation']['text'],
+                'language': result['translation']['language'],
+                'role': result['translation']['role'],
+                'message_id': shared_message_id  # Share the same ID
+            }
+            
+            # Add messages to queue for display
+            self.message_queue.put(original_msg)
+            self.message_queue.put(translation_msg)
+            
+        except Exception as e:
+            self.status.text = f"Translation failed: {str(e)}"
+            print(f"Translation failed: {e}", file=sys.stderr)
+            Clock.schedule_once(lambda dt: setattr(self.status, 'text',
+                'Type to translate | Click to select | Ctrl+S to export'), 3)
+
+
+class StreamApp(App):
+    def build(self):
+        Window.clearcolor = (0.02, 0.02, 0.05, 1)
+        Window.size = (1200, 800)  # Larger window for better visibility
+        self.title = 'Translation Stream'
+        return StreamGUI()
+
+
+if __name__ == '__main__':
+    StreamApp().run()
